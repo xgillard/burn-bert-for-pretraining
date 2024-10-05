@@ -5,7 +5,7 @@
 * [x] Embedding
 * [x] Data/Batcher
 * [x] Model
-* [ ] Pretraining Head
+* [x] Pretraining Head (note: I cannot produce a bi objective classification output -- which is sad)
 * [ ] Training
 * [ ] Save/Load from/to hub 
 * [ ] Classification Head

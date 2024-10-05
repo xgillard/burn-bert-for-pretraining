@@ -1,8 +1,8 @@
-use burn::{data::dataloader::batcher::Batcher, nn::attention::{generate_padding_mask, GeneratePaddingMask}, prelude::Backend, tensor::{Distribution, Int, Shape, Tensor, TensorData}};
+use burn::{config::Config, data::dataloader::batcher::Batcher, module::Module, nn::{attention::{generate_padding_mask, GeneratePaddingMask}, loss::CrossEntropyLossConfig}, prelude::Backend, tensor::{backend::AutodiffBackend, Distribution, Int, Shape, Tensor, TensorData}, train::{ClassificationOutput, TrainOutput, TrainStep, ValidStep}};
 use derive_builder::Builder;
 use tokenizers::Encoding;
 
-use super::BertInputBatch;
+use super::{BertInputBatch, BertMLMHead, BertMLMHeadConfig, BertModel, BertModelConfig, BertTokenClassificationHead, BertTokenClassificationHeadConfig};
 
 /// One single input item for the bert pretraining. 
 /// It comprises both a tokenized sentence pair and one nsp label
@@ -56,6 +56,92 @@ pub struct BertPreTrainingBatcher<B: Backend> {
     pub voc_size: usize,
     /// the device where the tensors must be created
     pub device: B::Device
+}
+
+/// Configuration for the pretraining head
+#[derive(Debug, Config)]
+pub struct BertPreTrainingHeadConfig {
+    /// 'hidden' size of the embeddings
+    #[config(default="768")]
+    pub hidden_size: usize,
+    /// small value whose role is to prevent division by zero in layer norm
+    #[config(default="1e-12")]
+    pub layer_norm_eps: f64,
+    /// size of the word token vocabulary
+    #[config(default="30522")]
+    pub vocab_size: usize,
+    /// size of the segment vocabulary (default 2)
+    #[config(default="2")]
+    pub type_vocab_size: usize,
+    /// std deviation when initializing the weights
+    #[config(default="0.02")]
+    pub initializer_range: f64,
+    /// probability that an embedding neuron be deactivated during a training step
+    #[config(default="0.1")]
+    pub hidden_dropout_prob: f64,
+}
+
+/// The actual pretraining head stacked on top of a bert model when pretraining
+#[derive(Debug, Module)]
+pub struct BertPreTrainingHead<B: Backend> {
+    mlm: BertMLMHead<B>,
+    nsp: BertTokenClassificationHead<B>
+}
+
+/// Pretraining head output
+#[derive(Debug)]
+pub struct BertPreTrainingOutput<B: Backend> {
+    pub mlm: Tensor<B, 3>,
+    pub nsp: Tensor<B, 2>
+}
+
+#[derive(Debug, Config)]
+pub struct BertForPreTrainingConfig {
+    // ---- embedding ---------
+    /// size of the word token vocabulary
+    #[config(default="30522")]
+    pub vocab_size: usize,
+    /// identifier of the pad token
+    #[config(default="0")]
+    pub pad_token_id: usize,
+    /// size of the segment vocabulary (default 2)
+    #[config(default="2")]
+    pub type_vocab_size: usize,
+    /// max length of any processable sequence
+    #[config(default="512")]
+    pub max_position_embeddings: usize,
+    /// 'hidden' size of the embeddings
+    #[config(default="768")]
+    pub hidden_size: usize,
+    /// probability that an embedding neuron be deactivated during a training step
+    #[config(default="0.1")]
+    pub hidden_dropout_prob: f64,
+    /// small value whose role is to prevent division by zero in layer norm
+    #[config(default="1e-12")]
+    pub layer_norm_eps: f64,
+    // ---- encoder
+    /// probability that a neuron from the hidden layers in the encoder be deactivated during training
+    #[config(default="0.1")]
+    pub attention_probs_dropout_prob: f64,
+    /// std deviation when initializing the encoder weights
+    #[config(default="0.02")]
+    pub initializer_range: f64,
+    /// output size of the hidden layers
+    #[config(default="3072")]
+    pub intermediate_size: usize,
+    /// number of self attention heads in the encoder
+    #[config(default="12")]
+    pub num_attention_heads: usize,
+    /// number of encoder layers
+    #[config(default="12")]
+    pub num_hidden_layers: usize,
+}
+
+/// The actual bert for pre training model
+#[derive(Debug, Module)]
+pub struct BertForPreTraining<B: Backend> {
+    model: BertModel<B>,
+    head: BertPreTrainingHead<B>
 }
 
 impl <B: Backend> BertPreTrainingBatcher<B> {
@@ -145,14 +231,115 @@ impl <B: Backend> Batcher<BertPreTrainingInputItem, BertPreTrainingInputBatch<B>
     }
 }
 
+impl BertPreTrainingHeadConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BertPreTrainingHead<B> {
+        let mlm = BertMLMHeadConfig::new()
+            .with_hidden_size(self.hidden_size)
+            .with_initializer_range(self.initializer_range)
+            .with_layer_norm_eps(self.layer_norm_eps)
+            .with_vocab_size(self.vocab_size)
+            .init(device);
+        let nsp = BertTokenClassificationHeadConfig::new()
+            .with_hidden_dropout_prob(self.hidden_dropout_prob)
+            .with_hidden_size(self.hidden_size)
+            .with_initializer_range(self.initializer_range)
+            .with_num_classes(2)
+            .init(device);
 
+        BertPreTrainingHead { mlm, nsp }
+    }
+}
+
+impl <B: Backend> BertPreTrainingHead<B> {
+    pub fn forward(&self, hidden: Tensor<B, 3>) -> BertPreTrainingOutput<B> {
+        let b = hidden.shape().dims[0];
+        let mlm = self.mlm.forward(hidden.clone());
+        let nsp = self.nsp.forward(hidden.slice([0..b, 0..1])).squeeze(1);
+
+        BertPreTrainingOutput{ mlm, nsp }
+    }
+}
+
+impl BertForPreTrainingConfig {
+    pub fn init<B: Backend>(&self, device: &B::Device) -> BertForPreTraining<B> {
+        let model = self.bert_config().init(device);
+        let head = self.head_config().init(device);
+
+        BertForPreTraining { model, head }
+    }
+    fn bert_config(&self) -> BertModelConfig {
+        BertModelConfig::new()
+            .with_attention_probs_dropout_prob(self.attention_probs_dropout_prob)
+            .with_hidden_dropout_prob(self.hidden_dropout_prob)
+            .with_hidden_size(self.hidden_size)
+            .with_initializer_range(self.initializer_range)
+            .with_intermediate_size(self.intermediate_size)
+            .with_layer_norm_eps(self.layer_norm_eps)
+            .with_max_position_embeddings(self.max_position_embeddings)
+            .with_num_attention_heads(self.num_attention_heads)
+            .with_num_hidden_layers(self.num_hidden_layers)
+            .with_pad_token_id(self.pad_token_id)
+            .with_type_vocab_size(self.type_vocab_size)
+            .with_vocab_size(self.vocab_size)
+    }
+    fn head_config(&self) -> BertPreTrainingHeadConfig {
+        BertPreTrainingHeadConfig::new()
+            .with_hidden_dropout_prob(self.hidden_dropout_prob)
+            .with_hidden_size(self.hidden_size)
+            .with_initializer_range(self.initializer_range)
+            .with_layer_norm_eps(self.layer_norm_eps)
+            .with_type_vocab_size(self.type_vocab_size)
+    }
+}
+
+impl <B: Backend> BertForPreTraining<B> {
+    pub fn forward(&self, input: BertInputBatch<B>) -> BertPreTrainingOutput<B> {
+        let hidden = self.model.forward(input);
+        self.head.forward(hidden)
+    }
+
+    pub fn foward_classification(&self, batch: BertPreTrainingInputBatch<B>) -> ClassificationOutput<B> {
+        let y_hat = self.forward(batch.input);
+        
+        let criterion = CrossEntropyLossConfig::new().init(&y_hat.mlm.device());
+        
+        let h = y_hat.mlm.shape().dims[2] as i32;
+        //
+        let yh_mlm = y_hat.mlm.clone().reshape([-1, h]);
+        let yh_nsp = y_hat.nsp.clone();
+        let y_mlm = batch.labels.mlm_labels.clone().reshape([-1]);
+        let y_nsp = batch.labels.nsp_labels.clone();
+        //
+        let mlm_loss = criterion.forward(yh_mlm, y_mlm);
+        let nsp_loss = criterion.forward(yh_nsp, y_nsp);
+        let tot_loss = mlm_loss + nsp_loss;
+        //
+        let o_mlm = y_hat.mlm.reshape([-1, h]);
+        let t_mlm = batch.labels.mlm_labels.reshape([-1]);
+
+        // SORRY: The classification output is imho too restrictive and will not allow bi-objective optimization
+        ClassificationOutput::new(tot_loss, o_mlm, t_mlm)
+    }
+}
+
+impl <B: AutodiffBackend> TrainStep<BertPreTrainingInputBatch<B>, ClassificationOutput<B>> for BertForPreTraining<B> {
+    fn step(&self, batch: BertPreTrainingInputBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
+        let classification = self.foward_classification(batch);
+        TrainOutput::new(self, classification.loss.backward(), classification)
+    }
+}
+impl <B: Backend> ValidStep<BertPreTrainingInputBatch<B>, ClassificationOutput<B>> for BertForPreTraining<B> {
+    fn step(&self, batch: BertPreTrainingInputBatch<B>) -> ClassificationOutput<B> {
+        self.foward_classification(batch)
+    }
+}
 
 #[cfg(test)]
 pub mod test {
     use burn::{backend::{wgpu::WgpuDevice, Wgpu}, data::dataloader::batcher::Batcher};
     use tokenizers::Tokenizer;
 
-    use crate::bert::{BertMLMHeadConfig, BertModelConfig};
+    use crate::bert::BertForPreTrainingConfig;
 
     use super::{BertPreTrainingBatcherBuilder, BertPreTrainingInputItemBuilder};
 
@@ -192,12 +379,12 @@ pub mod test {
 
         let batch = batcher.batch(vec![item1, item2]);
 
-        let model = BertModelConfig::new().init::<Wgpu>(&device);
-        let hidden = model.forward(batch.input);
-        let head = BertMLMHeadConfig::new().init(&device);
-        let hidden = head.forward(hidden);
+        let model = BertForPreTrainingConfig::new().init::<Wgpu>(&device);
+        let output = model.foward_classification(batch);
 
-        println!("{hidden:?}");
+        println!("{:?}", output.loss.into_scalar());
+        println!("{:?}", output.output.shape().dims);
+        println!("{:?}", output.targets.shape().dims);
 
     }
 }
