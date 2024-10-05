@@ -1,30 +1,29 @@
 use std::default::Default;
-use burn::{module::Module, nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig}, prelude::Backend, tensor::{Float, Int, Tensor}};
-use derive_builder::Builder;
+use burn::{config::Config, module::Module, nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig}, prelude::Backend, tensor::{Float, Int, Tensor}};
 
 /// Configuration of a Bert embedding
-#[derive(Debug, Clone, Copy, Builder)]
+#[derive(Debug, Copy, Config)]
 pub struct BertEmbeddingConfig {
     /// size of the word token vocabulary
-    #[builder(default="30522")]
+    #[config(default="30522")]
     pub vocab_size: usize,
     /// identifier of the pad token
-    #[builder(default="0")]
+    #[config(default="0")]
     pub pad_token_id: usize,
     /// size of the segment vocabulary (default 2)
-    #[builder(default="2")]
+    #[config(default="2")]
     pub type_vocab_size: usize,
     /// max length of any processable sequence
-    #[builder(default="512")]
+    #[config(default="512")]
     pub max_position_embeddings: usize,
     /// 'hidden' size of the embeddings
-    #[builder(default="768")]
+    #[config(default="768")]
     pub hidden_size: usize,
     /// probability that a neuron be deactivated during a training step
-    #[builder(default="0.1")]
+    #[config(default="0.1")]
     pub hidden_dropout_prob: f64,
     /// small value whose role is to prevent division by zero in layer norm
-    #[builder(default="1e-12")]
+    #[config(default="1e-12")]
     pub layer_norm_eps: f64,
 }
 
@@ -54,10 +53,6 @@ impl Default for BertEmbeddingConfig {
 }
 
 impl BertEmbeddingConfig {
-    pub fn new() -> Self {
-        BertEmbeddingConfigBuilder::create_empty().build().unwrap()
-    }
-
     pub fn init<B: Backend>(&self, device: &B::Device) -> BertEmbedding<B> {
         BertEmbedding {
             pad_token_id:            self.pad_token_id,
@@ -88,9 +83,8 @@ impl <B: Backend> BertEmbedding<B> {
 
         let embedding = words + segment + position;
         let embedding = self.layer_norm.forward(embedding);
-        let embedding = self.dropout.forward(embedding);
         //
-        embedding
+        self.dropout.forward(embedding)
     }
 }
 

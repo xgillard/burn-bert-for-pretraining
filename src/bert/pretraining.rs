@@ -2,6 +2,8 @@ use burn::{data::dataloader::batcher::Batcher, nn::attention::{generate_padding_
 use derive_builder::Builder;
 use tokenizers::Encoding;
 
+use super::BertInputBatch;
+
 /// One single input item for the bert pretraining. 
 /// It comprises both a tokenized sentence pair and one nsp label
 #[derive(Debug, Clone, Builder)]
@@ -12,26 +14,26 @@ pub struct BertPreTrainingInputItem {
     pub nsp_label: u32,
 }
 
-/// The input for a bert pretraining step.
+/// The input of a bert model.
 /// 
 /// The only mandatory input is the 'input_ids' field.
 #[derive(Debug, Clone, Builder)]
-pub struct BertPreTrainingInputBatch<B: Backend> {
-    /// The identifier of the encoded tokens 
-    /// Shape: [batch, sequence]
-    pub input_ids: Tensor<B, 2, Int>,
-    /// The segment identifiers 
-    /// Shape: [batch, sequence]
-    pub token_type_ids: Tensor<B, 2, Int>,
-    /// The attention mask to hide the padding stuff 
-    /// Shape: [batch, sequence]
-    pub attention_mask: Tensor<B, 2, Int>,
+pub struct BertPreTrainingLabelBatch<B: Backend> {
     /// The labels for the MLM task
     /// Shape: [batch, sequence]
     pub mlm_labels: Tensor<B, 2, Int>,
     /// The labels for the NSP task 
     /// Shape: [batch, sequence]
     pub nsp_labels: Tensor<B, 1, Int>,
+}
+
+/// The input for a bert pretraining step.
+/// 
+/// The only mandatory input is the 'input_ids' field.
+#[derive(Debug, Clone, Builder)]
+pub struct BertPreTrainingInputBatch<B: Backend> {
+    pub input: BertInputBatch<B>,
+    pub labels: BertPreTrainingLabelBatch<B>,
 }
 
 /// Creates a BertInputBatch from a series of bert pretraining inputs 
@@ -92,6 +94,7 @@ impl <B: Backend> BertPreTrainingBatcher<B> {
         
         for (i, item) in iter.enumerate() {
             tensor = tensor.slice_assign(
+                #[allow(clippy::single_range_in_vec_init)]
                 [i..i+1], 
                 Tensor::from_data(
                     TensorData::new(item.to_vec(), [1, item.len()]), 
@@ -116,7 +119,7 @@ impl <B: Backend> Batcher<BertPreTrainingInputItem, BertPreTrainingInputBatch<B>
             &self.device);
 
         let input_ids = tensor;
-        let attention_mask = mask.int();
+        let padding_mask = mask;
         let shape = input_ids.shape();
 
         let token_type_ids = self.to_tensor_of_shape(shape.clone(), items.iter().map(|i| i.encoding.get_type_ids()));
@@ -129,24 +132,33 @@ impl <B: Backend> Batcher<BertPreTrainingInputItem, BertPreTrainingInputBatch<B>
         let (input_ids, mlm_labels) = self.mask_tokens(input_ids, special_tokens);
 
         BertPreTrainingInputBatch {
-            input_ids,
-            token_type_ids,
-            attention_mask,
-            nsp_labels,
-            mlm_labels
+            input: BertInputBatch {
+                input_ids,
+                token_type_ids: Some(token_type_ids),
+                padding_mask: Some(padding_mask),
+            },
+            labels: BertPreTrainingLabelBatch { 
+                mlm_labels,
+                nsp_labels,
+            },
         }
     }
 }
+
+
 
 #[cfg(test)]
 pub mod test {
     use burn::{backend::{wgpu::WgpuDevice, Wgpu}, data::dataloader::batcher::Batcher};
     use tokenizers::Tokenizer;
 
+    use crate::bert::{BertMLMHeadConfig, BertModelConfig};
+
     use super::{BertPreTrainingBatcherBuilder, BertPreTrainingInputItemBuilder};
 
     #[test]
     fn test_tokenizer() {
+        let device = WgpuDevice::IntegratedGpu(0);
         let tok = Tokenizer::from_pretrained("xaviergillard/parti-pris-v2", None).unwrap();
 
         let mask_id = tok.get_added_vocabulary().get_vocab()["[MASK]"];
@@ -157,7 +169,7 @@ pub mod test {
             .mask_token_id(mask_id)
             .max_seq_length(15)
             .voc_size(tok.get_vocab_size(false))
-            .device(WgpuDevice::IntegratedGpu(0))
+            .device(device.clone())
             .build()
             .unwrap();
 
@@ -180,13 +192,12 @@ pub mod test {
 
         let batch = batcher.batch(vec![item1, item2]);
 
-        let data = batch.input_ids.slice([0..1]).into_data();
-        let input: &[i32] = data.as_slice().unwrap();
-        println!("{input:?}");
-        
-        let ids = input.into_iter().copied().map(|x| x as u32).collect::<Vec<_>>();
-        println!("{:?}", tok.decode(&ids, false));
+        let model = BertModelConfig::new().init::<Wgpu>(&device);
+        let hidden = model.forward(batch.input);
+        let head = BertMLMHeadConfig::new().init(&device);
+        let hidden = head.forward(hidden);
 
-        print!("{:?}", batch.mlm_labels.slice([0..1]).into_data().to_vec::<i32>())
+        println!("{hidden:?}");
+
     }
 }
