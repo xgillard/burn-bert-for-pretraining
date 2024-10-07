@@ -1,15 +1,16 @@
-use burn::{config::Config, data::dataloader::DataLoaderBuilder, module::Module, optim::AdamWConfig, record::CompactRecorder, tensor::backend::AutodiffBackend, train::{metric::{AccuracyMetric, LossMetric}, LearnerBuilder}};
-use crate::bert::{BertForPreTrainingConfig, BertPreTrainingBatcher, BertPreTrainingBatcherBuilder};
+use burn::{config::Config, data::{dataloader::DataLoaderBuilder, dataset::InMemDataset}, module::Module, optim::AdamWConfig, record::CompactRecorder, tensor::backend::AutodiffBackend, train::{metric::{AccuracyMetric, LossMetric}, LearnerBuilder}};
+use crate::bert::{BertForPreTrainingConfig, BertPreTrainingBatcher, BertPreTrainingBatcherBuilder, BertPreTrainingInputItem};
 
 #[derive(Config)]
 pub struct TrainingConfig {
     pub model: BertForPreTrainingConfig,
     pub optimizer: AdamWConfig,
+    pub artifact_dir: String, 
     #[config(default =  0)]
     pub mask_token_id: usize,
-    #[config(default = 1)]
+    #[config(default = 10)]
     pub num_epochs: usize,
-    #[config(default = 64)]
+    #[config(default = 2)]
     pub batch_size: usize,
     #[config(default = 4)]
     pub num_workers: usize,
@@ -25,7 +26,13 @@ fn create_artifact_dir(artifact_dir: &str) {
     std::fs::create_dir_all(artifact_dir).ok();
 }
 
-pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, device: B::Device) {
+pub fn train<B: AutodiffBackend>(
+    config: TrainingConfig, 
+    train: InMemDataset<BertPreTrainingInputItem>,
+    valid: InMemDataset<BertPreTrainingInputItem>,
+    device: B::Device) 
+{
+    let artifact_dir = &config.artifact_dir;
     create_artifact_dir(artifact_dir);
 
     config
@@ -39,7 +46,7 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
         .pad_token_id(config.model.pad_token_id as u32)
         .voc_size(config.model.vocab_size)
         .max_seq_length(config.model.max_position_embeddings as u32)
-        .device(device)
+        .device(device.clone())
         .build()
         .unwrap();
 
@@ -48,7 +55,7 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
         .pad_token_id(config.model.pad_token_id as u32)
         .voc_size(config.model.vocab_size)
         .max_seq_length(config.model.max_position_embeddings as u32)
-        .device(device)
+        .device(device.clone())
         .build()
         .unwrap();
 
@@ -56,13 +63,13 @@ pub fn train<B: AutodiffBackend>(artifact_dir: &str, config: TrainingConfig, dev
         .batch_size(config.batch_size)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
-        .build(MnistDataset::train());
+        .build(train);
 
     let dataloader_test = DataLoaderBuilder::new(batcher_valid)
         .batch_size(config.batch_size)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
-        .build(MnistDataset::test());
+        .build(valid);
 
     let learner = LearnerBuilder::new(artifact_dir)
         .metric_train_numeric(AccuracyMetric::new())

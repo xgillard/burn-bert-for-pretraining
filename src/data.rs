@@ -1,109 +1,76 @@
-use std::{fs::File, path::Path};
+use burn::data::dataset::InMemDataset;
+use rand::{random, seq::SliceRandom, thread_rng};
+use tokenizers::{Encoding, Tokenizer, TruncationParams};
 
-use derive_builder::Builder;
-use parquet::{file::reader::SerializedFileReader, record::{Field, Row}};
+use crate::bert::BertPreTrainingInputItem;
+use rayon::prelude::*;
 
-use crate::error::Error;
 
-pub fn read_parquet<P: AsRef<Path>>(fname: P) -> Result<Vec<BertTrainingInput>, Error> {
-    let file = File::open(fname)?;
-    let reader = SerializedFileReader::new(file)?;
-    let mut data = vec![];
 
-    for row in reader.into_iter() {
-        data.push(row?.try_into()?);
-    }
-    Ok(data)
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AllTexts {
+    pub title: String,
+    pub full_text: String,
 }
 
-/// A record for pretraining a bert model
-#[derive(Debug, Clone, Builder)]
-pub struct BertTrainingInput {
-    pub input_tokens:        Vec<i32>,
-    pub token_type_ids:      Vec<i32>,
-    pub attention_mask:      Vec<i32>,
-    pub special_tokens_mask: Vec<i32>,
-    pub next_sentence_label: bool,
-}
-
-impl TryFrom<Row> for BertTrainingInput {
-    type Error = crate::error::Error;
-
-    fn try_from(row: Row) -> Result<Self, Self::Error> {
-        let mut builder = BertTrainingInputBuilder::create_empty();
-
-        for (column, field) in row.into_columns() {
-            match column.as_str() {
-                "input_ids"           => { builder.input_tokens(FieldWrapper::from(&field).try_into()?);},
-                "token_type_ids"      => { builder.token_type_ids(FieldWrapper::from(&field).try_into()?);},
-                "attention_mask"      => { builder.attention_mask(FieldWrapper::from(&field).try_into()?);},
-                "special_tokens_mask" => { builder.special_tokens_mask(FieldWrapper::from(&field).try_into()?);},
-                "next_sentence_label" => { builder.next_sentence_label(FieldWrapper::from(&field).try_into()?);},
-                _ => {/* ignore */}
-            }
-        }
-        Ok(builder.build()?)
+impl AllTexts {
+    pub fn all_text(self) -> String {
+        format!("{}\n{}", self.title, self.full_text)
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FieldWrapper<'a> {
-    field: &'a Field
-}
-
-impl <'a> From<&'a Field> for FieldWrapper<'a> {
-    fn from(field: &'a Field) -> Self {
-        FieldWrapper{field}
+fn encoding_to_vec(mut e: Encoding, tok: &Tokenizer) -> Vec<String> {
+    let mut out = vec![];
+    out.push(tok.decode(e.get_ids(), true).unwrap());
+    for i in e.take_overflowing() {
+        let x = tok.decode(i.get_ids(), true).unwrap();
+        out.push(x);
     }
+    out
 }
 
-/// Tries to parse a parquet field to a boolean value
-impl TryFrom<FieldWrapper<'_>> for bool {
-    type Error = crate::error::Error;
 
-    fn try_from(field: FieldWrapper) -> Result<Self, Self::Error> {
-        if let Field::Bool(b) = field.field {
-            Ok(*b)
-        } else {
-            Err(Error::NotABoolean)
-        }
-    }
-}
+pub fn data_from_csv(fname: &str, tok: &mut Tokenizer, stride: usize) -> (InMemDataset<BertPreTrainingInputItem>, InMemDataset<BertPreTrainingInputItem>){
+    tok.with_truncation(Some(TruncationParams{stride, ..Default::default()})).unwrap();
 
-/// Tries to parse a parquet field to an i32 value
-impl TryFrom<FieldWrapper<'_>> for i32 {
-    type Error = crate::error::Error;
+    let mut rdr = csv::ReaderBuilder::new()
+        .from_path(fname)
+        .unwrap();
 
-    fn try_from(field: FieldWrapper) -> Result<Self, Self::Error> {
-        match field.field {
-            Field::Double(x) => Ok(*x as i32),
-            Field::Byte(x)    => Ok(*x as i32),
-            Field::Float(x)  => Ok(*x as i32),
-            Field::Int(x)    => Ok(*x),
-            Field::Long(x)   => Ok(*x as i32),
-            Field::UByte(x)   => Ok(*x as i32),
-            Field::UInt(x)   => Ok(*x as i32),
-            Field::ULong(x)  => Ok(*x as i32),
-            _ => Err(Error::NotAnInt)
+    let data = rdr.deserialize()
+        .par_bridge()
+        .filter(|x: &Result<AllTexts, csv::Error>| x.is_ok())
+        .flatten()
+        .map(|x| x.all_text())
+        .map(|x| tok.encode(x, true).unwrap())
+        .map(|x| encoding_to_vec(x, tok))
+        .collect::<Vec<_>>();
+
+    let mut dset = vec![];
+    tok.with_truncation(None).unwrap();
+    let n = data.len();
+    for (i, xs) in data.iter().enumerate() {
+        for (j, x) in xs.iter().enumerate() {
+            let mut nsp: bool = random() && j < xs.len() -1;
+            let next = if nsp {
+                &xs[j+1]
+            } else {
+                let nx = f32::floor(rand::random::<f32>() * n as f32) as usize;
+                nsp = nx == i && j == 0;
+                &data[nx][0]
+            };
+
+            dset.push(
+                BertPreTrainingInputItem {
+                    encoding: tok.encode((x.as_str(), next.as_str()), true).unwrap(),
+                    nsp_label: if nsp { 0 } else { 1 },
+                }
+            );
         }
     }
-}
 
+    dset.shuffle(&mut thread_rng());
+    let (train, valid) = dset.split_at_mut(data.len() * 8 / 10);
 
-impl <'a, T> TryFrom<FieldWrapper<'a>> for Vec<T> 
-where T: TryFrom<FieldWrapper<'a>, Error = crate::error::Error>
-{
-    type Error = crate::error::Error;
-
-    fn try_from(field: FieldWrapper<'a>) -> Result<Self, Self::Error> {
-        if let Field::ListInternal(lst) = field.field {
-            let mut data = Vec::with_capacity(lst.len());
-            for elt in lst.elements() {
-                data.push(FieldWrapper::from(elt).try_into()?);
-            }
-            Ok(data)
-        } else {
-            Err(Error::NotAList)
-        }
-    }
+    (InMemDataset::new(train.to_vec()), InMemDataset::new(valid.to_vec()))
 }
